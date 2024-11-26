@@ -36,9 +36,15 @@ import warnings
 from configargparse import ConfigFileParserException, ConfigFileParser, ArgumentParser
 
 if sys.version_info >= (3, 11):
-    import tomllib as toml 
+    from tomllib import load as _toml_load
+    import io
+    # The tomllib module from the standard library 
+    # expect a binary IO and will fail if reveives otherwise. 
+    # So we hack a compat function that will work with TextIO and assume the utf-8 encoding.
+    def toml_load(fp: TextIO) -> Any:
+        return _toml_load(io.BytesIO(stream.read().encode()))
 else:
-    import toml
+    from toml import load as toml_load
 
 # I did not invented these regex, just put together some stuff from:
 # - https://stackoverflow.com/questions/11859442/how-to-match-string-in-quotes-using-regex
@@ -168,7 +174,7 @@ class TomlConfigParser(ConfigFileParser):
         """Parses the keys and values from a TOML config file."""
         # parse with configparser to allow multi-line values
         try:
-            config = toml.load(stream)
+            config = toml_load(stream)
         except Exception as e:
             raise ConfigFileParserException("Couldn't parse TOML file: %s" % e)
 
