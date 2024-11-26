@@ -25,6 +25,7 @@ from __future__ import annotations
 import argparse
 from collections import OrderedDict
 import re
+import sys
 from typing import Any, Callable, Dict, List, Optional, Tuple, TextIO, Union
 import csv
 import functools
@@ -33,7 +34,11 @@ from ast import literal_eval
 import warnings
 
 from configargparse import ConfigFileParserException, ConfigFileParser, ArgumentParser
-import toml
+
+if sys.version_info >= (3, 11):
+    import tomllib as toml 
+else:
+    import toml
 
 # I did not invented these regex, just put together some stuff from:
 # - https://stackoverflow.com/questions/11859442/how-to-match-string-in-quotes-using-regex
