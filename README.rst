@@ -73,6 +73,14 @@ What's New?
 in development
 ^^^^^^^^^^^^^^
 
+* Fix a bug that would cause a variable marked as `Final` not being considered as a constant if
+  it was declared under a control-flow block.
+* Fix a bug in google and numpy "Attributes" section in module docstring: 
+  the module attributes now shows as "Variables" instead of "Instance Variables".
+
+pydoctor 24.11.0
+^^^^^^^^^^^^^^^^
+
 * Drop Python 3.7 and support Python 3.13.
 * Implement canonical HTML element (``<link rel="canonical" href="..."/>``) to help search engines reduce outdated content. 
   Enable this feature by passing the base URL of the API documentation with option ``--html-base-url``.
