@@ -70,8 +70,8 @@ You can select a different format using the ``--docformat`` option or the ``__do
 What's New?
 ~~~~~~~~~~~
 
-in development
-^^^^^^^^^^^^^^
+pydoctor 24.11.1
+^^^^^^^^^^^^^^^^
 
 * Fix a bug that would cause a variable marked as `Final` not being considered as a constant if
   it was declared under a control-flow block.
