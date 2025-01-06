@@ -70,8 +70,10 @@ You can select a different format using the ``--docformat`` option or the ``__do
 What's New?
 ~~~~~~~~~~~
 
-in development
-^^^^^^^^^^^^^^
+pydoctor 24.11.2
+^^^^^^^^^^^^^^^^
+
+* Replace deprecated usage of ``datetime.datetime.utcfromtimestamp()``
 
 pydoctor 24.11.1
 ^^^^^^^^^^^^^^^^
