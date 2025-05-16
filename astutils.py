@@ -1,20 +1,34 @@
 """
 Various bits of reusable code related to L{ast.AST} node processing.
 """
+from __future__ import annotations
 
 import inspect
 import platform
 import sys
 from numbers import Number
-from typing import Iterator, Optional, List, Iterable, Sequence, TYPE_CHECKING, Tuple, Union, cast
+from typing import Any, Callable, Collection, Iterator, Optional, List, Iterable, Sequence, TYPE_CHECKING, Tuple, Union, cast
 from inspect import BoundArguments, Signature
 import ast
+
+if sys.version_info >= (3, 9):
+    from ast import unparse as _unparse
+else:
+    from astor import to_source as _unparse
 
 from pydoctor import visitor
 
 if TYPE_CHECKING:
     from pydoctor import model
 
+def unparse(node:ast.AST) -> str:
+    """
+    This function convert a node tree back into python sourcecode.
+
+    Uses L{ast.unparse} or C{astor.to_source} for python versions before 3.9.
+    """
+    return _unparse(node)
+    
 # AST visitors
 
 def iter_values(node: ast.AST) -> Iterator[ast.AST]:
@@ -101,11 +115,21 @@ def node2dottedname(node: Optional[ast.AST]) -> Optional[List[str]]:
     parts.reverse()
     return parts
 
-def node2fullname(expr: Optional[ast.AST], ctx: 'model.Documentable') -> Optional[str]:
+def node2fullname(expr: Optional[ast.AST], 
+                  ctx: model.Documentable | None = None, 
+                  *,
+                  expandName:Callable[[str], str] | None = None) -> Optional[str]:
+    if expandName is None:
+        if ctx is None:
+            raise TypeError('this function takes exactly two arguments')
+        expandName = ctx.expandName
+    elif ctx is not None:
+        raise TypeError('this function takes exactly two arguments')
+
     dottedname = node2dottedname(expr)
     if dottedname is None:
         return None
-    return ctx.expandName('.'.join(dottedname))
+    return expandName('.'.join(dottedname))
 
 def bind_args(sig: Signature, call: ast.Call) -> BoundArguments:
     """
@@ -137,6 +161,7 @@ if sys.version_info[:2] >= (3, 8):
         return isinstance(expr, ast.Constant) and expr.value == s
 else:
     # Before Python 3.8 "foo" was parsed as ast.Str.
+    # TODO: remove me when python3.7 is not supported anymore
     def get_str_value(expr:ast.expr) -> Optional[str]:
         if isinstance(expr, ast.Str):
             return expr.s
@@ -193,7 +218,11 @@ def is_using_annotations(expr: Optional[ast.AST],
 
 def is_none_literal(node: ast.expr) -> bool:
     """Does this AST node represent the literal constant None?"""
-    return isinstance(node, (ast.Constant, ast.NameConstant)) and node.value is None
+    if sys.version_info >= (3,8):
+        return isinstance(node, ast.Constant) and node.value is None
+    else:
+        # TODO: remove me when python3.7 is not supported anymore
+        return isinstance(node, (ast.Constant, ast.NameConstant)) and node.value is None
     
 def unstring_annotation(node: ast.expr, ctx:'model.Documentable', section:str='annotation') -> ast.expr:
     """Replace all strings in the given expression by parsed versions.
@@ -244,7 +273,12 @@ class _AnnotationStringParser(ast.NodeTransformer):
         else:
             # Other subscript; unstring the slice.
             slice = self.visit(node.slice)
-        return ast.copy_location(ast.Subscript(value, slice, node.ctx), node)
+        return ast.copy_location(ast.Subscript(value=value, slice=slice, ctx=node.ctx), node)
+
+    def visit_fast(self, node: ast.expr) -> ast.expr:
+        return node
+    
+    visit_Attribute = visit_Name = visit_fast
 
     # For Python >= 3.8:
 
@@ -258,9 +292,91 @@ class _AnnotationStringParser(ast.NodeTransformer):
             return const
 
     # For Python < 3.8:
+    if sys.version_info < (3,8):
+        # TODO: remove me when python3.7 is not supported anymore
+        def visit_Str(self, node: ast.Str) -> ast.expr:
+            return ast.copy_location(self._parse_string(node.s), node)
 
-    def visit_Str(self, node: ast.Str) -> ast.expr:
-        return ast.copy_location(self._parse_string(node.s), node)
+def upgrade_annotation(node: ast.expr, ctx: model.Documentable, section:str='annotation') -> ast.expr:
+    """
+    Transform the annotation to use python 3.10+ syntax. 
+    """
+    return _UpgradeDeprecatedAnnotations(ctx).visit(node)
+
+class _UpgradeDeprecatedAnnotations(ast.NodeTransformer):
+    if TYPE_CHECKING:
+        def visit(self, node:ast.AST) -> ast.expr:...
+
+    def __init__(self, ctx: model.Documentable) -> None:
+        def _node2fullname(node:ast.expr) -> str | None:
+            return node2fullname(node, expandName=ctx.expandAnnotationName)
+        self.node2fullname = _node2fullname
+
+    def _union_args_to_bitor(self, args: list[ast.expr], ctxnode:ast.AST) -> ast.BinOp:
+        assert len(args) > 1
+        *others, right = args
+        if len(others) == 1:
+            rnode = ast.BinOp(left=others[0], right=right, op=ast.BitOr())
+        else:
+            rnode = ast.BinOp(left=self._union_args_to_bitor(others, ctxnode), right=right, op=ast.BitOr())
+    
+        return ast.fix_missing_locations(ast.copy_location(rnode, ctxnode))
+
+    def visit_Name(self, node: ast.Name | ast.Attribute) -> Any:
+        fullName = self.node2fullname(node)
+        if fullName in DEPRECATED_TYPING_ALIAS_BUILTINS:
+            return ast.Name(id=DEPRECATED_TYPING_ALIAS_BUILTINS[fullName], ctx=ast.Load())
+        # TODO: Support all deprecated aliases including the ones in the collections.abc module.
+        # In order to support that we need to generate the parsed docstring directly and include 
+        # custom refmap or transform the ast such that missing imports are added.
+        return node
+
+    visit_Attribute = visit_Name
+
+    def visit_Subscript(self, node: ast.Subscript) -> ast.expr:
+        node.value = self.visit(node.value)
+        node.slice = self.visit(node.slice)
+        fullName = self.node2fullname(node.value)
+        
+        if fullName == 'typing.Union':
+            # typing.Union can be used with a single type or a 
+            # tuple of types, includea single element tuple, which is the same
+            # as the directly using the type: Union[x] == Union[(x,)] == x
+            slice_ = node.slice
+            if sys.version_info <= (3,9) and isinstance(slice_, ast.Index): # Compat
+                slice_ = slice_.value
+            if isinstance(slice_, ast.Tuple):
+                args = slice_.elts
+                if len(args) > 1:
+                    return self._union_args_to_bitor(args, node)
+                elif len(args) == 1:
+                    return args[0]
+            elif isinstance(slice_, (ast.Attribute, ast.Name, ast.Subscript, ast.BinOp)):
+                return slice_
+        
+        elif fullName == 'typing.Optional':
+            # typing.Optional requires a single type, so we don't process when slice is a tuple.
+            slice_ = node.slice
+            if sys.version_info <= (3,9) and isinstance(slice_, ast.Index): # Compat
+                slice_ = slice_.value
+            if isinstance(slice_, (ast.Attribute, ast.Name, ast.Subscript, ast.BinOp)):
+                return self._union_args_to_bitor([slice_, ast.Constant(value=None)], node)
+
+        return node
+    
+DEPRECATED_TYPING_ALIAS_BUILTINS = {
+        "typing.Text": 'str',
+        "typing.Dict": 'dict',
+        "typing.Tuple": 'tuple',
+        "typing.Type": 'type',
+        "typing.List": 'list',
+        "typing.Set": 'set',
+        "typing.FrozenSet": 'frozenset',
+}
+
+# These do not belong in the deprecated builtins aliases, so we make sure it doesn't happen.
+assert 'typing.Union' not in DEPRECATED_TYPING_ALIAS_BUILTINS
+assert 'typing.Optional' not in DEPRECATED_TYPING_ALIAS_BUILTINS
 
 TYPING_ALIAS = (
         "typing.Hashable",
@@ -282,31 +398,26 @@ TYPING_ALIAS = (
         "typing.Sequence",
         "typing.MutableSequence",
         "typing.ByteString",
-        "typing.Tuple",
-        "typing.List",
         "typing.Deque",
-        "typing.Set",
-        "typing.FrozenSet",
         "typing.MappingView",
         "typing.KeysView",
         "typing.ItemsView",
         "typing.ValuesView",
         "typing.ContextManager",
         "typing.AsyncContextManager",
-        "typing.Dict",
         "typing.DefaultDict",
         "typing.OrderedDict",
         "typing.Counter",
         "typing.ChainMap",
         "typing.Generator",
         "typing.AsyncGenerator",
-        "typing.Type",
         "typing.Pattern",
         "typing.Match",
         # Special forms
         "typing.Union",
         "typing.Literal",
         "typing.Optional",
+        *DEPRECATED_TYPING_ALIAS_BUILTINS, 
     )
 
 SUBSCRIPTABLE_CLASSES_PEP585 = (
@@ -316,6 +427,12 @@ SUBSCRIPTABLE_CLASSES_PEP585 = (
         "set",
         "frozenset",
         "type",
+        "builtins.tuple",
+        "builtins.list",
+        "builtins.dict",
+        "builtins.set",
+        "builtins.frozenset",
+        "builtins.type",
         "collections.deque",
         "collections.defaultdict",
         "collections.OrderedDict",
@@ -357,6 +474,18 @@ def is_typing_annotation(node: ast.AST, ctx: 'model.Documentable') -> bool:
     return is_using_annotations(node, TYPING_ALIAS, ctx) or \
             is_using_annotations(node, SUBSCRIPTABLE_CLASSES_PEP585, ctx)
 
+def get_docstring_node(node: ast.AST) -> Str | None:
+    """
+    Return the docstring node for the given class, function or module
+    or None if no docstring can be found.
+    """
+    if not isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef, ast.ClassDef, ast.Module)) or not node.body:
+        return None
+    node = node.body[0]
+    if isinstance(node, ast.Expr):
+        if isinstance(node.value, Str):
+            return node.value
+    return None
 
 _string_lineno_is_end = sys.version_info < (3,8) \
                     and platform.python_implementation() != 'PyPy'
@@ -364,7 +493,35 @@ _string_lineno_is_end = sys.version_info < (3,8) \
 line in the string, rather than the first line.
 """
 
-def extract_docstring_linenum(node: ast.Str) -> int:
+
+class _StrMeta(type):
+    if sys.version_info >= (3,8):
+        def __instancecheck__(self, instance: object) -> bool:
+            if isinstance(instance, ast.expr):
+                return get_str_value(instance) is not None
+            return False
+    else:
+        # TODO: remove me when python3.7 is not supported
+        def __instancecheck__(self, instance: object) -> bool:
+            return isinstance(instance, ast.Str)
+
+class Str(ast.expr, metaclass=_StrMeta):
+    """
+    Wraps ast.Constant/ast.Str for `isinstance` checks and annotations. 
+    Ensures that the value is actually a string.
+    Do not try to instanciate this class.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        raise TypeError(f'{Str.__qualname__} cannot be instanciated')
+
+    if sys.version_info >= (3,8):
+        value: str
+    else:
+        # TODO: remove me when python3.7 is not supported
+        s: str
+
+def extract_docstring_linenum(node: Str) -> int:
     r"""
     In older CPython versions, the AST only tells us the end line
     number and we must approximate the start line number.
@@ -374,7 +531,11 @@ def extract_docstring_linenum(node: ast.Str) -> int:
     Leading blank lines are stripped by cleandoc(), so we must
     return the line number of the first non-blank line.
     """
-    doc = node.s
+    if sys.version_info >= (3,8):
+        doc = node.value
+    else:
+        # TODO: remove me when python3.7 is not supported
+        doc = node.s
     lineno = node.lineno
     if _string_lineno_is_end:
         # In older CPython versions, the AST only tells us the end line
@@ -393,7 +554,7 @@ def extract_docstring_linenum(node: ast.Str) -> int:
     
     return lineno
 
-def extract_docstring(node: ast.Str) -> Tuple[int, str]:
+def extract_docstring(node: Str) -> Tuple[int, str]:
     """
     Extract docstring information from an ast node that represents the docstring.
 
@@ -401,8 +562,13 @@ def extract_docstring(node: ast.Str) -> Tuple[int, str]:
         - The line number of the first non-blank line of the docsring. See L{extract_docstring_linenum}.
         - The docstring to be parsed, cleaned by L{inspect.cleandoc}.
     """
+    if sys.version_info >= (3,8):
+        value = node.value
+    else:
+        # TODO: remove me when python3.7 is not supported
+        value = node.s
     lineno = extract_docstring_linenum(node)
-    return lineno, inspect.cleandoc(node.s)
+    return lineno, inspect.cleandoc(value)
 
 
 def infer_type(expr: ast.expr) -> Optional[ast.expr]:
@@ -432,13 +598,14 @@ def _annotation_for_value(value: object) -> Optional[ast.expr]:
             if ann_value is None:
                 ann_elem = None
             elif ann_elem is not None:
-                ann_elem = ast.Tuple(elts=[ann_elem, ann_value])
+                ann_elem = ast.Tuple(elts=[ann_elem, ann_value], ctx=ast.Load())
         if ann_elem is not None:
             if name == 'tuple':
-                ann_elem = ast.Tuple(elts=[ann_elem, ast.Ellipsis()])
-            return ast.Subscript(value=ast.Name(id=name),
-                                 slice=ast.Index(value=ann_elem))
-    return ast.Name(id=name)
+                ann_elem = ast.Tuple(elts=[ann_elem, ast.Constant(value=...)], ctx=ast.Load())
+            return ast.Subscript(value=ast.Name(id=name, ctx=ast.Load()),
+                                 slice=ann_elem,
+                                 ctx=ast.Load())
+    return ast.Name(id=name, ctx=ast.Load())
 
 def _annotation_for_elements(sequence: Iterable[object]) -> Optional[ast.expr]:
     names = set()
@@ -451,26 +618,26 @@ def _annotation_for_elements(sequence: Iterable[object]) -> Optional[ast.expr]:
             return None
     if len(names) == 1:
         name = names.pop()
-        return ast.Name(id=name)
+        return ast.Name(id=name, ctx=ast.Load())
     else:
         # Empty sequence or no uniform type.
         return None
 
       
-class Parentage(ast.NodeTransformer):
+class Parentage(ast.NodeVisitor):
     """
     Add C{parent} attribute to ast nodes instances.
     """
-    # stolen from https://stackoverflow.com/a/68845448
-    parent: Optional[ast.AST] = None
+    def __init__(self) -> None:
+        self.current: ast.AST | None = None
 
-    def visit(self, node: ast.AST) -> ast.AST:
-        setattr(node, 'parent', self.parent)
-        self.parent = node
-        node = super().visit(node)
-        if isinstance(node, ast.AST):
-            self.parent = getattr(node, 'parent')
-        return node
+    def generic_visit(self, node: ast.AST) -> None:
+        current = self.current
+        setattr(node, 'parent', current)
+        self.current = node
+        for child in ast.iter_child_nodes(node):
+            self.generic_visit(child)
+        self.current = current
 
 def get_parents(node:ast.AST) -> Iterator[ast.AST]:
     """
@@ -484,3 +651,122 @@ def get_parents(node:ast.AST) -> Iterator[ast.AST]:
             yield from _yield_parents(p)
     yield from _yield_parents(getattr(node, 'parent', None))
 
+#Part of the astor library for Python AST manipulation.
+#License: 3-clause BSD
+#Copyright (c) 2015 Patrick Maupin
+_op_data = """
+    GeneratorExp                1
+
+          Assign                1
+       AnnAssign                1
+       AugAssign                0
+            Expr                0
+           Yield                1
+       YieldFrom                0
+              If                1
+             For                0
+        AsyncFor                0
+           While                0
+          Return                1
+
+           Slice                1
+       Subscript                0
+           Index                1
+        ExtSlice                1
+    comprehension_target        1
+           Tuple                0
+  FormattedValue                0
+
+           Comma                1
+       NamedExpr                1
+          Assert                0
+           Raise                0
+    call_one_arg                1
+
+          Lambda                1
+           IfExp                0
+
+   comprehension                1
+              Or   or           1
+             And   and          1
+             Not   not          1
+
+              Eq   ==           1
+              Gt   >            0
+             GtE   >=           0
+              In   in           0
+              Is   is           0
+           NotEq   !=           0
+              Lt   <            0
+             LtE   <=           0
+           NotIn   not in       0
+           IsNot   is not       0
+
+           BitOr   |            1
+          BitXor   ^            1
+          BitAnd   &            1
+          LShift   <<           1
+          RShift   >>           0
+             Add   +            1
+             Sub   -            0
+            Mult   *            1
+             Div   /            0
+             Mod   %            0
+        FloorDiv   //           0
+         MatMult   @            0
+          PowRHS                1
+          Invert   ~            1
+            UAdd   +            0
+            USub   -            0
+             Pow   **           1
+           Await                1
+             Num                1
+        Constant                1
+"""
+
+_op_data = [x.split() for x in _op_data.splitlines()] # type:ignore
+_op_data = [[x[0], ' '.join(x[1:-1]), int(x[-1])] for x in _op_data if x] # type:ignore
+for _index in range(1, len(_op_data)):
+    _op_data[_index][2] *= 2 # type:ignore
+    _op_data[_index][2] += _op_data[_index - 1][2] # type:ignore
+
+_deprecated: Collection[str] = ()
+if sys.version_info >= (3, 12):
+    _deprecated = ('Num', 'Str', 'Bytes', 'Ellipsis', 'NameConstant')
+_precedence_data = dict((getattr(ast, x, None), z) for x, y, z in _op_data if x not in _deprecated) # type:ignore
+_symbol_data = dict((getattr(ast, x, None), y) for x, y, z in _op_data if x not in _deprecated) # type:ignore
+
+class op_util:
+    """
+    This class provides data and functions for mapping
+    AST nodes to symbols and precedences.
+    """
+    @classmethod
+    def get_op_symbol(cls, obj:ast.operator|ast.boolop|ast.cmpop|ast.unaryop,
+                      fmt:str='%s', 
+                      symbol_data:dict[type[ast.AST]|None, str]=_symbol_data, 
+                      type:Callable[[object], type[Any]]=type) -> str:
+        """Given an AST node object, returns a string containing the symbol.
+        """
+        return fmt % symbol_data[type(obj)]
+    @classmethod
+    def get_op_precedence(cls, obj:ast.AST, 
+                          precedence_data:dict[type[ast.AST]|None, int]=_precedence_data, 
+                          type:Callable[[object], type[Any]]=type) -> int:
+        """Given an AST node object, returns the precedence.
+
+        @raises KeyError: If the node is not explicitely supported by this function. 
+            This is a very legacy piece of code, all calls to L{get_op_precedence} should be
+            guarded in a C{try:... except KeyError:...} statement.
+        """
+        return precedence_data[type(obj)]
+
+    if not TYPE_CHECKING:
+        class Precedence(object):
+            vars().update((cast(str, x), z) for x, _, z in _op_data)
+            highest = max(cast(int, z) for _, _, z in _op_data) + 2
+    else:
+        Precedence: Any
+
+del _op_data, _index, _precedence_data, _symbol_data, _deprecated
+# This was part of the astor library for Python AST manipulation.

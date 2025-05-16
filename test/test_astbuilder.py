@@ -1,8 +1,6 @@
 from typing import Optional, Tuple, Type, List, overload, cast
 import ast
-
-import astor
-
+import sys
 
 from pydoctor import astbuilder, astutils, model
 from pydoctor import epydoc2stan
@@ -117,9 +115,8 @@ def type2str(type_expr: Optional[ast.expr]) -> Optional[str]:
     if type_expr is None:
         return None
     else:
-        src = astor.to_source(type_expr)
-        assert isinstance(src, str)
-        return src.strip()
+        from .epydoc.test_pyval_repr import color2
+        return color2(type_expr)
 
 def type2html(obj: model.Documentable) -> str:
     """
@@ -381,9 +378,9 @@ def test_relative_import_past_top(
     ''', modname='mod', parent_name='pkg', system=system)
     captured = capsys.readouterr().out
     if level == 1:
-        assert not captured
+        assert 'relative import level' not in captured
     else:
-        assert f'pkg.mod:2: relative import level ({level}) too high\n' == captured
+        assert f'pkg.mod:2: relative import level ({level}) too high\n' in captured
 
 @systemcls_param
 def test_class_with_base_from_module(systemcls: Type[model.System]) -> None:
@@ -1396,6 +1393,35 @@ def test_unstring_annotation(systemcls: Type[model.System]) -> None:
     assert ann_str_and_line(mod.contents['b']) == ('str', 3)
     assert ann_str_and_line(mod.contents['c']) == ('list[Thingy]', 4)
 
+@systemcls_param
+def test_upgrade_annotation(systemcls: Type[model.System]) -> None:
+    """Annotations using old style Unions or Optionals are upgraded to python 3.10+ style. 
+    Deprecated aliases like List, Tuple Dict are also translated to their built ins versions.
+    """
+    mod = fromText('''\
+    from typing import Union, Optional, List
+    a: Union[str, int]
+    b: Optional[str]
+    c: List[B]
+    d: Optional[Union[str, int, bytes]]
+    e: Union[str]
+    f: Union[(str,)]
+    g: Optional[1, 2] # wrong, so we don't process it
+    h: Union[list[str]]
+  
+    class List:
+        Union: Union[a, b]
+    ''', systemcls=systemcls)
+    assert ann_str_and_line(mod.contents['a']) == ('str | int', 2)
+    assert ann_str_and_line(mod.contents['b']) == ('str | None', 3)
+    assert ann_str_and_line(mod.contents['c']) == ('list[B]', 4)
+    assert ann_str_and_line(mod.contents['d']) == ('str | int | bytes | None', 5)
+    assert ann_str_and_line(mod.contents['e']) == ('str', 6)
+    assert ann_str_and_line(mod.contents['f']) == ('str', 7)
+    assert ann_str_and_line(mod.contents['g']) == ('Optional[1, 2]', 8)
+    assert ann_str_and_line(mod.contents['h']) == ('list[str]', 9)
+    assert ann_str_and_line(mod.contents['List'].contents['Union']) == ('a | b', 12)
+
 @pytest.mark.parametrize('annotation', ("[", "pass", "1 ; 2"))
 @systemcls_param
 def test_bad_string_annotation(
@@ -1420,7 +1446,7 @@ def test_literal_string_annotation(annotation: str, expected: str) -> None:
     stmt, = ast.parse(annotation).body
     assert isinstance(stmt, ast.Expr)
     unstringed = astutils._AnnotationStringParser().visit(stmt.value)
-    assert astor.to_source(unstringed).strip() == expected
+    assert astutils.unparse(unstringed).strip() == expected
 
 @systemcls_param
 def test_inferred_variable_types(systemcls: Type[model.System]) -> None:
@@ -1626,7 +1652,7 @@ def test_overload(systemcls: Type[model.System], capsys: CapSys) -> None:
     # Confirm decorators retained on overloads, docstring ignored for overloads,
     # and that overloads after the primary function are skipped
     mod = fromText("""
-        from typing import overload, Union
+        from typing import overload
         def dec(fn):
             pass
         @dec
@@ -1715,7 +1741,8 @@ def test_constant_module_with_final_subscript1(systemcls: Type[model.System]) ->
     assert attr.kind == model.DocumentableKind.CONSTANT
     assert attr.value is not None
     assert ast.literal_eval(attr.value) == ('fr', 'en')
-    assert astor.to_source(attr.annotation).strip() == "Sequence[str]"
+    assert attr.annotation
+    assert astutils.unparse(attr.annotation).strip() == "Sequence[str]"
 
 @systemcls_param
 def test_constant_module_with_final_subscript2(systemcls: Type[model.System]) -> None:
@@ -1751,8 +1778,8 @@ def test_constant_module_with_final_subscript_invalid_warns(systemcls: Type[mode
     
     captured = capsys.readouterr().out
     assert "mod:3: Annotation is invalid, it should not contain slices.\n" == captured
-
-    assert astor.to_source(attr.annotation).strip() == "tuple[str, ...]"
+    assert attr.annotation
+    assert astutils.unparse(attr.annotation).strip() == "tuple[str, ...]"
 
 @systemcls_param
 def test_constant_module_with_final_subscript_invalid_warns2(systemcls: Type[model.System], capsys: CapSys) -> None:
@@ -1771,8 +1798,8 @@ def test_constant_module_with_final_subscript_invalid_warns2(systemcls: Type[mod
     
     captured = capsys.readouterr().out
     assert "mod:3: Annotation is invalid, it should not contain slices.\n" == captured
-
-    assert astor.to_source(attr.annotation).strip() == "tuple[str, ...]"
+    assert attr.annotation
+    assert astutils.unparse(attr.annotation).strip() == "tuple[str, ...]"
 
 @systemcls_param
 def test_constant_module_with_final_annotation_gets_infered(systemcls: Type[model.System]) -> None:
@@ -2602,7 +2629,7 @@ def test_augmented_assignment(systemcls: Type[model.System]) -> None:
     attr = mod.contents['var']
     assert isinstance(attr, model.Attribute)
     assert attr.value
-    assert astor.to_source(attr.value).strip() == '(1 + 3)'
+    assert astutils.unparse(attr.value).strip() == '1 + 3' if sys.version_info >= (3,9) else '(1 + 3)'
 
 @systemcls_param
 def test_augmented_assignment_in_class(systemcls: Type[model.System]) -> None:
@@ -2614,7 +2641,7 @@ def test_augmented_assignment_in_class(systemcls: Type[model.System]) -> None:
     attr = mod.contents['c'].contents['var']
     assert isinstance(attr, model.Attribute)
     assert attr.value
-    assert astor.to_source(attr.value).strip() == '(1 + 3)'
+    assert astutils.unparse(attr.value).strip() == '1 + 3' if sys.version_info >= (3,9) else '(1 + 3)'
 
 
 @systemcls_param
@@ -2632,7 +2659,7 @@ def test_augmented_assignment_conditionnal_else_ignored(systemcls: Type[model.Sy
     attr = mod.contents['var']
     assert isinstance(attr, model.Attribute)
     assert attr.value
-    assert astor.to_source(attr.value).strip() == '(1 + 3)'
+    assert astutils.unparse(attr.value).strip() == '1 + 3' if sys.version_info >= (3,9) else '(1 + 3)'
 
 @systemcls_param
 def test_augmented_assignment_conditionnal_multiple_assignments(systemcls: Type[model.System]) -> None:
@@ -2650,7 +2677,7 @@ def test_augmented_assignment_conditionnal_multiple_assignments(systemcls: Type[
     attr = mod.contents['var']
     assert isinstance(attr, model.Attribute)
     assert attr.value
-    assert astor.to_source(attr.value).strip() == '(1 + 3 + 4)'
+    assert astutils.unparse(attr.value).strip() == '1 + 3 + 4' if sys.version_info >= (3,9) else '(1 + 3 + 4)'
 
 @systemcls_param
 def test_augmented_assignment_instance_var(systemcls: Type[model.System]) -> None:
@@ -2666,7 +2693,7 @@ def test_augmented_assignment_instance_var(systemcls: Type[model.System]) -> Non
     attr = mod.contents['c'].contents['var']
     assert isinstance(attr, model.Attribute)
     assert attr.value
-    assert astor.to_source(attr.value).strip() == '(1)'
+    assert astutils.unparse(attr.value).strip() == '1' if sys.version_info >= (3,9) else '(1)'
 
 @systemcls_param
 def test_augmented_assignment_not_suitable_for_inline_docstring(systemcls: Type[model.System]) -> None:

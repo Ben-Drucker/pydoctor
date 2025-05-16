@@ -89,12 +89,12 @@ def test_html_empty_module() -> None:
     mod = fromText('''
     """C{thing}"""
     ''', modname='module')
-    assert docstring2html(mod) == '<div>\n<p>\n<tt class="rst-docutils literal">thing</tt>\n</p>\n</div>'
+    assert docstring2html(mod) == '<div>\n<p>\n<tt class="rst-docutils rst-literal">thing</tt>\n</p>\n</div>'
 
     mod = fromText('''
     """My C{thing}."""
     ''', modname='module')
-    assert docstring2html(mod) == '<div>\n<p>My <tt class="rst-docutils literal">thing</tt>.</p>\n</div>'
+    assert docstring2html(mod) == '<div>\n<p>My <tt class="rst-docutils rst-literal">thing</tt>.</p>\n</div>'
 
     mod = fromText('''
     """
@@ -423,7 +423,7 @@ def test_func_arg_not_inherited(capsys: CapSys) -> None:
     class Sub(Base):
         def __init__(self):
             super().__init__(1)
-    ''')
+    ''', modname='test')
     epydoc2stan.format_docstring(mod.contents['Base'].contents['__init__'])
     assert capsys.readouterr().out == ''
     epydoc2stan.format_docstring(mod.contents['Sub'].contents['__init__'])
@@ -487,7 +487,7 @@ def test_constructor_param_on_class(capsys: CapSys) -> None:
         """
         def __init__(self, p):
             pass
-    ''')
+    ''', modname='test')
     html = ''.join(docstring2html(mod.contents['C']).splitlines())
     assert '<td class="fieldArgDesc">Constructor parameter.</td>' in html
     # Non-existing parameters should still end up in the output, because:
@@ -496,7 +496,7 @@ def test_constructor_param_on_class(capsys: CapSys) -> None:
     #   an existing parameter but the name in the @param field has a typo
     assert '<td class="fieldArgDesc">Not a constructor parameter.</td>' in html
     captured = capsys.readouterr().out
-    assert captured == '<test>:5: Documented parameter "q" does not exist\n'
+    assert captured == 'test:5: Documented parameter "q" does not exist\n'
 
 
 def test_func_raise_linked() -> None:
@@ -566,7 +566,7 @@ def test_func_starargs(capsys: CapSys) -> None:
         """
         def __init__(*args: int, **kwargs) -> None:
             ...
-    ''', modname='<great>')
+    ''', modname='great')
 
     mod_epy_no_star = fromText('''
     class f:
@@ -579,7 +579,7 @@ def test_func_starargs(capsys: CapSys) -> None:
         """
         def __init__(*args: int, **kwargs) -> None:
             ...
-    ''', modname='<good>')
+    ''', modname='good')
 
     mod_rst_star = fromText(r'''
     __docformat__='restructuredtext'
@@ -593,7 +593,7 @@ def test_func_starargs(capsys: CapSys) -> None:
         """
         def __init__(*args: int, **kwargs) -> None:
             ...
-    ''', modname='<great>')
+    ''', modname='great')
 
     mod_rst_no_star = fromText('''
     __docformat__='restructuredtext'
@@ -607,7 +607,7 @@ def test_func_starargs(capsys: CapSys) -> None:
         """
         def __init__(*args: int, **kwargs) -> None:
             ...
-    ''', modname='<great>')
+    ''', modname='great')
 
     mod_epy_star_fmt = docstring2html(mod_epy_star.contents['f'])
     mod_epy_no_star_fmt = docstring2html(mod_epy_no_star.contents['f'])
@@ -1482,6 +1482,9 @@ def test_module_docformat(capsys: CapSys) -> None:
     captured = capsys.readouterr().out
     assert not captured
 
+    system = model.System()
+    system.options.docformat = 'epytext'
+
     mod = fromText('''
     """
     Link to pydoctor: `pydoctor <https://github.com/twisted/pydoctor>`_.
@@ -1520,14 +1523,18 @@ def test_module_docformat_inheritence(capsys: CapSys) -> None:
 
     system = model.System()
     system.options.docformat = 'restructuredtext'
-    top = fromText(top_src, modname='top', is_package=True, system=system)
-    fromText(pkg_src, modname='pkg', parent_name='top', is_package=True,
-                   system=system)
-    mod = fromText(mod_src, modname='top.pkg.mod', parent_name='top.pkg', system=system)
+    builder = system.systemBuilder(system)
+    builder.addModuleString(top_src, modname='top', is_package=True)
+    builder.addModuleString(pkg_src, modname='pkg', parent_name='top', is_package=True)
+    builder.addModuleString(mod_src, modname='mod', parent_name='top.pkg')
+    builder.buildModules()
     
+    top = system.allobjects['top']
+    mod = system.allobjects['top.pkg.mod']
+    assert isinstance(mod, model.Module)
+    assert mod.docformat == 'epytext'
     captured = capsys.readouterr().out
     assert not captured
-
     assert ''.join(docstring2html(top.contents['f']).splitlines()) == ''.join(docstring2html(mod.contents['f']).splitlines())
     
 
@@ -1553,10 +1560,14 @@ def test_module_docformat_with_docstring_inheritence(capsys: CapSys) -> None:
     '''
 
     system = model.System()
+    builder = system.systemBuilder(system)
     system.options.docformat = 'epytext'
 
-    mod = fromText(mod_src, modname='mod', system=system)
-    mod2 = fromText(mod2_src, modname='mod2', system=system)
+    builder.addModuleString(mod_src, modname='mod',)
+    builder.addModuleString(mod2_src, modname='mod2',)
+    builder.buildModules()
+    mod = system.allobjects['mod']
+    mod2 = system.allobjects['mod2']
     
     captured = capsys.readouterr().out
     assert not captured
@@ -1610,11 +1621,14 @@ def test_constant_values_rst(capsys: CapSys) -> None:
     '''
 
     system = model.System()
+    builder = system.systemBuilder(system)
     system.options.docformat = 'restructuredtext'
 
-    fromText("", modname='pack', system=system, is_package=True)
-    fromText(mod1, modname='mod1', system=system, parent_name='pack')
-    mod = fromText(mod2, modname='mod2', system=system, parent_name='pack')
+    builder.addModuleString("", modname='pack', is_package=True)
+    builder.addModuleString(mod1, modname='mod1',parent_name='pack')    
+    builder.addModuleString(mod2, modname='mod2', parent_name='pack')
+    builder.buildModules()
+    mod = system.allobjects['pack.mod2']
     
     captured = capsys.readouterr().out
     assert not captured

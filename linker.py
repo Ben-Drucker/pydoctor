@@ -1,6 +1,7 @@
 """
 This module provides implementations of epydoc's L{DocstringLinker} class.
 """
+from __future__ import annotations
 
 import contextlib
 from twisted.web.template import Tag, tags
@@ -130,8 +131,11 @@ class _EpydocLinker(DocstringLinker):
         """
         return self.obj.system.intersphinx.getLink(name)
 
-    def link_to(self, identifier: str, label: "Flattenable") -> Tag:
-        fullID = self.obj.expandName(identifier)
+    def link_to(self, identifier: str, label: "Flattenable", *, is_annotation: bool = False) -> Tag:
+        if is_annotation:
+            fullID = self.obj.expandAnnotationName(identifier)
+        else:
+            fullID = self.obj.expandName(identifier)
 
         target = self.obj.system.objForFullName(fullID)
         if target is not None:
@@ -249,8 +253,7 @@ class _AnnotationLinker(DocstringLinker):
         self._obj = obj
         self._module = obj.module
         self._scope = obj.parent or obj
-        self._module_linker = self._module.docstring_linker
-        self._scope_linker = self._scope.docstring_linker
+        self._scope_linker = _EpydocLinker(self._scope)
     
     @property
     def obj(self) -> 'model.Documentable':
@@ -260,7 +263,7 @@ class _AnnotationLinker(DocstringLinker):
         # report a low-level message about ambiguous annotation
         mod_ann = self._module.expandName(target)
         obj_ann = self._scope.expandName(target)
-        if mod_ann != obj_ann:
+        if mod_ann != obj_ann and '.' in obj_ann and '.' in mod_ann:
             self.obj.report(
                 f'ambiguous annotation {target!r}, could be interpreted as '
                 f'{obj_ann!r} instead of {mod_ann!r}', section='annotation',
@@ -271,11 +274,7 @@ class _AnnotationLinker(DocstringLinker):
         with self.switch_context(self._obj):
             if self._module.isNameDefined(target):
                 self.warn_ambiguous_annotation(target)
-                return self._module_linker.link_to(target, label)
-            elif self._scope.isNameDefined(target):
-                return self._scope_linker.link_to(target, label)
-            else:
-                return self._module_linker.link_to(target, label)
+            return self._scope_linker.link_to(target, label, is_annotation=True)
     
     def link_xref(self, target: str, label: "Flattenable", lineno: int) -> Tag:
         with self.switch_context(self._obj):
@@ -283,6 +282,5 @@ class _AnnotationLinker(DocstringLinker):
 
     @contextlib.contextmanager
     def switch_context(self, ob:Optional['model.Documentable']) -> Iterator[None]:
-        with self._module_linker.switch_context(ob):
-            with self._scope_linker.switch_context(ob):
-                yield
+        with self._scope_linker.switch_context(ob):
+            yield
