@@ -1,6 +1,7 @@
 """The classes that turn  L{Documentable} instances into objects we can render."""
 from __future__ import annotations
 
+import re
 from typing import (
     TYPE_CHECKING, Dict, Iterator, List, Optional, Mapping, Sequence,
     Type, Union
@@ -58,7 +59,21 @@ def format_signature(func: Union[model.Function, model.FunctionOverload]) -> "Fl
     """
     broken = "(...)"
     try:
-        return html2stan(str(func.signature)) if func.signature else broken
+        if len(str(func.signature)) > 80:
+            all_variables = [x for x in func.annotations.keys() if x != 'return']
+            var_positions = []
+            for v in all_variables:
+                var_positions.append(re.search(v, str(func.signature)))
+            just_indices = [x.start() for x in var_positions]
+            list_fs = list(str(func.signature))
+            fake_tab = " "*4
+            for i in reversed(just_indices):
+                list_fs.insert(i, f'<br></br>{fake_tab}')
+            joined = "".join(list_fs)
+        else:
+            joined = str(func.signature)
+        joined = joined.replace("->", " ➔ ")
+        return html2stan(joined if func.signature else broken)
     except Exception as e:
         # We can't use safe_to_stan() here because we're using Signature.__str__ to generate the signature HTML.
         epydoc2stan.reportErrors(func.primary if isinstance(func, model.FunctionOverload) else func, 

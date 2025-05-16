@@ -1,0 +1,13 @@
+build
+MANIFEST
+dist
+**/*.pyc
+.tox/
+.coverage
+.DS_Store
+*~
+_trial_temp/
+apidocs/
+*.egg-info
+.eggs
+**/*.DS_Store
