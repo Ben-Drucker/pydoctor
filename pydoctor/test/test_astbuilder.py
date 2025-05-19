@@ -8,7 +8,7 @@ from pydoctor.epydoc.markup import DocstringLinker, ParsedDocstring
 from pydoctor.options import Options
 from pydoctor.stanutils import flatten, html2stan, flatten_text
 from pydoctor.epydoc.markup.epytext import Element, ParsedEpytextDocstring
-from pydoctor.epydoc2stan import format_summary, get_parsed_type
+from pydoctor.epydoc2stan import _get_docformat, format_summary, get_parsed_type
 from pydoctor.test.test_packages import processPackage
 from pydoctor.utils import partialclass
 
@@ -1953,7 +1953,7 @@ def test_not_a_constant_module(systemcls: Type[model.System], capsys:CapSys) -> 
         THING = 'EN'
     OTHER = 1
     OTHER += 1
-    E: typing.Final = 2
+    E: typing.Final = 2 # it's considered a constant because it's explicitely marked Final
     E = 4
     LIST = [2.14]
     LIST.insert(0,0)
@@ -1961,7 +1961,7 @@ def test_not_a_constant_module(systemcls: Type[model.System], capsys:CapSys) -> 
     assert mod.contents['LANG'].kind is model.DocumentableKind.VARIABLE
     assert mod.contents['THING'].kind is model.DocumentableKind.VARIABLE
     assert mod.contents['OTHER'].kind is model.DocumentableKind.VARIABLE
-    assert mod.contents['E'].kind is model.DocumentableKind.VARIABLE
+    assert mod.contents['E'].kind is model.DocumentableKind.CONSTANT
 
     # all-caps mutables variables are flagged as constant: this is a trade-off
     # in between our weeknesses in terms static analysis (that is we don't recognized list modifications) 
@@ -1994,6 +1994,27 @@ def test__name__equals__main__is_skipped(systemcls: Type[model.System]) -> None:
         pass
     ''', modname='test', systemcls=systemcls)
     assert tuple(mod.contents) == ('foo', 'bar')
+
+@systemcls_param
+def test__name__equals__main__is_skipped_but_orelse_processes(systemcls: Type[model.System]) -> None:
+    """
+    Code inside of C{if __name__ == '__main__'} should be skipped, but the else block should be processed.
+    """
+    mod = fromText('''
+    foo = True
+    if __name__ == '__main__':
+        var = True
+        def fun():
+            pass
+        class Class:
+            pass
+    else:
+        class Very:
+            ...
+    def bar():
+        pass
+    ''', modname='test', systemcls=systemcls)
+    assert tuple(mod.contents) == ('foo', 'Very', 'bar' )
 
 @systemcls_param
 def test_variable_named_like_current_module(systemcls: Type[model.System]) -> None:
@@ -2060,6 +2081,302 @@ def test_reexport_wildcard(systemcls: Type[model.System]) -> None:
     assert system.allobjects['top._impl'].resolveName('f') == system.allobjects['top'].contents['f']
     assert system.allobjects['_impl2'].resolveName('i') == system.allobjects['top'].contents['i']
     assert all(n in system.allobjects['top'].contents for n in  ['f', 'g', 'h', 'i', 'j'])
+
+@systemcls_param
+def test_module_level_attributes_and_aliases(systemcls: Type[model.System]) -> None:
+    """
+    Variables and aliases defined in the main body of a Try node will have priority over the names defined in the except handlers.
+    """
+    system = systemcls()
+    builder = system.systemBuilder(system)
+    builder.addModuleString('''
+    ssl = 1
+    ''', modname='twisted.internet')
+    builder.addModuleString('''
+    try:
+        from twisted.internet import ssl as _ssl
+        # The names defined in the body of the if block wins over the
+        # names defined in the except handler
+        ssl = _ssl
+        var = 1
+        VAR = 1
+        ALIAS = _ssl
+    except ImportError:
+        ssl = None
+        var = 2
+        VAR = 2
+        ALIAS = None
+    ''', modname='mod')
+    builder.buildModules()
+    mod = system.allobjects['mod']
+    
+    # Test alias
+    assert mod.expandName('ssl')=="twisted.internet.ssl"
+    assert mod.expandName('_ssl')=="twisted.internet.ssl"
+    s = mod.resolveName('ssl')
+    assert isinstance(s, model.Attribute)
+    assert s.value is not None
+    assert ast.literal_eval(s.value)==1
+    assert s.kind == model.DocumentableKind.VARIABLE
+    
+    # Test variable
+    assert mod.expandName('var')=="mod.var"
+    v = mod.resolveName('var')
+    assert isinstance(v, model.Attribute)
+    assert v.value is not None
+    assert ast.literal_eval(v.value)==1
+    assert v.kind == model.DocumentableKind.VARIABLE
+
+    # Test variable 2
+    assert mod.expandName('VAR')=="mod.VAR"
+    V = mod.resolveName('VAR')
+    assert isinstance(V, model.Attribute)
+    assert V.value is not None
+    assert ast.literal_eval(V.value)==1
+    assert V.kind == model.DocumentableKind.VARIABLE
+
+    # Test variable 3
+    assert mod.expandName('ALIAS')=="twisted.internet.ssl"
+    s = mod.resolveName('ALIAS')
+    assert isinstance(s, model.Attribute)
+    assert s.value is not None
+    assert ast.literal_eval(s.value)==1
+    assert s.kind == model.DocumentableKind.VARIABLE
+
+@systemcls_param
+def test_module_level_attributes_and_aliases_orelse(systemcls: Type[model.System]) -> None:
+    """
+    We visit the try orelse body and these names have priority over the names in the except handlers.
+    """
+    system = systemcls()
+    builder = system.systemBuilder(system)
+    builder.addModuleString('''
+    ssl = 1
+    ''', modname='twisted.internet')
+    builder.addModuleString('''
+    try:
+        from twisted.internet import ssl as _ssl
+    except ImportError:
+        ssl = None
+        var = 2
+        VAR = 2
+        ALIAS = None
+        newname = 2
+    else:
+        # The names defined in the orelse or finally block wins over the
+        # names defined in the except handler
+        ssl = _ssl
+        var = 1
+    finally:
+        VAR = 1
+        ALIAS = _ssl
+    
+    if sys.version_info > (3,7):
+        def func():
+            'func doc'
+        class klass:
+            'klass doc'
+        var2 = 1
+        'var2 doc'
+    else:
+        # these definition will be ignored since they are
+        # alreade definied in the body of the If block.
+        func = None
+        'not this one'
+        def klass():
+            'not this one'
+        class var2:
+            'not this one'
+    ''', modname='mod')
+    builder.buildModules()
+    mod = system.allobjects['mod']
+
+    # Tes newname survives the override guard
+    assert 'newname' in mod.contents
+    
+    # Test alias
+    assert mod.expandName('ssl')=="twisted.internet.ssl"
+    assert mod.expandName('_ssl')=="twisted.internet.ssl"
+    s = mod.resolveName('ssl')
+    assert isinstance(s, model.Attribute)
+    assert s.value is not None
+    assert ast.literal_eval(s.value)==1
+    assert s.kind == model.DocumentableKind.VARIABLE
+    
+    # Test variable
+    assert mod.expandName('var')=="mod.var"
+    v = mod.resolveName('var')
+    assert isinstance(v, model.Attribute)
+    assert v.value is not None
+    assert ast.literal_eval(v.value)==1
+    assert v.kind == model.DocumentableKind.VARIABLE
+
+    # Test variable 2
+    assert mod.expandName('VAR')=="mod.VAR"
+    V = mod.resolveName('VAR')
+    assert isinstance(V, model.Attribute)
+    assert V.value is not None
+    assert ast.literal_eval(V.value)==1
+    assert V.kind == model.DocumentableKind.VARIABLE
+
+    # Test variable 3
+    assert mod.expandName('ALIAS')=="twisted.internet.ssl"
+    s = mod.resolveName('ALIAS')
+    assert isinstance(s, model.Attribute)
+    assert s.value is not None
+    assert ast.literal_eval(s.value)==1
+    assert s.kind == model.DocumentableKind.VARIABLE
+
+    # Test if override guard
+    func, klass, var2 = mod.resolveName('func'), mod.resolveName('klass'), mod.resolveName('var2')
+    assert isinstance(func, model.Function) 
+    assert func.docstring == 'func doc'
+    assert isinstance(klass, model.Class)
+    assert klass.docstring == 'klass doc'
+    assert isinstance(var2, model.Attribute)
+    assert var2.docstring == 'var2 doc'
+
+@systemcls_param
+def test_method_level_orelse_handlers_use_case1(systemcls: Type[model.System]) -> None:
+    system = systemcls()
+    builder = system.systemBuilder(system)
+    builder.addModuleString('''
+    class K:
+        def test(self, ):...
+        def __init__(self, text):
+            try:
+                self.test()
+            except:
+                # Even if this attribute is only defined in the except block in a function/method
+                # it will be included in the documentation. 
+                self.error = True
+            finally:
+                self.name = text
+                if sys.version_info > (3,0):
+                    pass
+                elif sys.version_info > (2,6):
+                    # Idem for these instance attributes
+                    self.legacy = True
+                    self.still_supported = True
+                else:
+                    # This attribute is ignored, the same rules that applies
+                    # at the module level applies here too.
+                    # since it's already defined in the upper block If.body
+                    # this assigment is ignored.
+                    self.still_supported = False
+    ''', modname='mod')
+    builder.buildModules()
+    mod = system.allobjects['mod']
+    assert isinstance(mod, model.Module)
+    K = mod.contents['K']
+    assert isinstance(K, model.Class)
+    assert K.resolveName('legacy') == K.contents['legacy']
+    assert K.resolveName('error') == K.contents['error']
+    assert K.resolveName('name') == K.contents['name']
+    s = K.contents['still_supported']
+    assert K.resolveName('still_supported') == s
+    assert isinstance(s, model.Attribute)
+    assert ast.literal_eval(s.value or '') == True
+
+@systemcls_param
+def test_method_level_orelse_handlers_use_case2(systemcls: Type[model.System]) -> None:
+    system = systemcls()
+    builder = system.systemBuilder(system)
+    builder.addModuleString('''
+    class K:
+        def __init__(self, d:dict, g:Iterator):
+            try:
+                next(g)
+            except StopIteration:
+                # this should be documented
+                self.data = d
+            else:
+                raise RuntimeError("the generator wasn't exhausted!")
+            finally:
+                if sys.version_info < (3,7):
+                    raise RuntimeError("please upadate your python version to 3.7 al least!")
+                else:
+                    # Idem for this instance attribute
+                    self.ok = True
+    ''', modname='mod')
+    builder.buildModules()
+    mod = system.allobjects['mod']
+    assert isinstance(mod, model.Module)
+    K = mod.contents['K']
+    assert isinstance(K, model.Class)
+    assert K.resolveName('data') == K.contents['data']
+    assert K.resolveName('ok') == K.contents['ok']
+
+
+@systemcls_param
+def test_class_level_attributes_and_aliases_orelse(systemcls: Type[model.System]) -> None:
+    system = systemcls()
+    builder = system.systemBuilder(system)
+    builder.addModuleString('crazy_var=2', modname='crazy')
+    builder.addModuleString('''
+    if sys.version_info > (3,0):
+        thing = object
+        class klass(thing):
+            'klass doc'
+            var2 = 3
+        
+        # regular import
+        from crazy import crazy_var as cv
+    else:
+        # these imports will be ignored because the names
+        # have been defined in the body of the If block.
+        from six import t as thing 
+        import klass
+        from crazy27 import crazy_var as cv
+
+        # Wildcard imports are still processed 
+        # in name override guard context
+        from crazy import * 
+
+        # this import is not ignored
+        from six import seven
+
+        # this class is not ignored and will be part of the public docs.
+        class klassfallback(thing): 
+            'klassfallback doc'
+            var2 = 1
+            # this overrides var2
+            var2 = 2 
+        
+        # this is ignored because the name 'klass' 
+        # has been defined in the body of the If block.
+        klass = klassfallback                 
+        'ignored'
+
+        var3 = 1
+        # this overrides var3
+        var3 = 2 
+    ''', modname='mod')
+    builder.buildModules()
+    mod = system.allobjects['mod']
+    assert isinstance(mod, model.Module)
+
+    klass, klassfallback, var2, var3 = \
+        mod.resolveName('klass'), \
+        mod.resolveName('klassfallback'), \
+        mod.resolveName('klassfallback.var2'), \
+        mod.resolveName('var3')
+
+    assert isinstance(klass, model.Class)
+    assert isinstance(klassfallback, model.Class)
+    assert isinstance(var2, model.Attribute)
+    assert isinstance(var3, model.Attribute)
+
+    assert klassfallback.docstring == 'klassfallback doc'
+    assert klass.docstring == 'klass doc'
+    assert ast.literal_eval(var2.value or '') == 2
+    assert ast.literal_eval(var3.value or '') == 2
+    
+    assert mod.expandName('cv') == 'crazy.crazy_var'
+    assert mod.expandName('thing') == 'object'
+    assert mod.expandName('seven') == 'six.seven'
+    assert 'klass' not in mod._localNameToFullName_map
+    assert 'crazy_var' in mod._localNameToFullName_map # from the wildcard
 
 @systemcls_param
 def test_exception_kind(systemcls: Type[model.System], capsys: CapSys) -> None:
@@ -2793,3 +3110,172 @@ def test_mutilple_docstring_with_doc_comments_warnings(systemcls: Type[model.Sys
     fromText(src, systemcls=systemcls)
     # TODO: handle doc comments.x
     assert capsys.readouterr().out == '<test>:18: Existing docstring at line 14 is overriden\n'
+
+@systemcls_param
+def test_import_all_inside_else_branch_is_processed(systemcls: Type[model.System], capsys: CapSys) -> None:
+    src1 = '''
+    Callable = ...
+    '''
+
+    src2 = '''
+    Callable = ...
+    TypeAlias = ...
+    '''
+
+    src0 = '''
+    import sys
+    if sys.version_info > (3, 10):
+        from typing import *
+    else:
+        from typing_extensions import *
+    '''
+
+    system = systemcls()
+    builder = systemcls.systemBuilder(system)
+    builder.addModuleString(src0, 'main')
+    builder.addModuleString(src1, 'typing')
+    builder.addModuleString(src2, 'typing_extensions')
+    builder.buildModules()
+    # assert not capsys.readouterr().out
+    main = system.allobjects['main']
+    assert list(main.localNames()) == ['sys', 'Callable', 'TypeAlias'] # type: ignore
+    assert main.expandName('Callable') == 'typing.Callable'
+    assert main.expandName('TypeAlias') == 'typing_extensions.TypeAlias'
+
+@systemcls_param
+def test_inline_docstring_multiple_assigments(systemcls: Type[model.System], capsys: CapSys) -> None:
+    # TODO: this currently does not support nested tuple assignments.
+    src = '''
+    class C:
+        def __init__(self):
+            self.x, x = 1, 1; 'x docs'
+            self.y = x = 1; 'y docs'
+    x,y = 1,1; 'x and y docs'
+    v = w = 1; 'v and w docs'
+    '''
+    mod =  fromText(src, systemcls=systemcls)
+    assert not capsys.readouterr().out
+    assert mod.contents['x'].docstring == 'x and y docs'
+    assert mod.contents['y'].docstring == 'x and y docs'
+    assert mod.contents['v'].docstring == 'v and w docs'
+    assert mod.contents['w'].docstring == 'v and w docs'
+    assert mod.contents['C'].contents['x'].docstring == 'x docs'
+    assert mod.contents['C'].contents['y'].docstring == 'y docs'
+
+
+@systemcls_param
+def test_does_not_misinterpret_string_as_documentation(systemcls: Type[model.System], capsys: CapSys) -> None:
+    # exmaple from numpy/distutils/ccompiler_opt.py
+    src = '''
+    __docformat__ = 'numpy'
+    class C:
+        """
+        Attributes
+        ----------
+        cc_noopt : bool
+            docs
+        """
+        def __init__(self):
+            self.cc_noopt = x
+
+            if True:
+                """
+                this is not documentation
+                """
+    '''
+
+    mod =  fromText(src, systemcls=systemcls)
+    assert _get_docformat(mod) == 'numpy'
+    assert not capsys.readouterr().out
+    assert mod.contents['C'].contents['cc_noopt'].docstring is None 
+    # The docstring is None... this is the sad side effect of processing ivar fields :/
+
+    assert to_html(mod.contents['C'].contents['cc_noopt'].parsed_docstring) == 'docs' #type:ignore
+
+@systemcls_param
+def test_unsupported_usage_of_self(systemcls: Type[model.System], capsys: CapSys) -> None:
+    src = '''
+    class C:
+        ...
+    def C_init(self):
+        self.x = True; 'not documentation'
+        self.y += False # erroneous usage of augassign; 'not documentation'
+    C.__init__ = C_init
+
+    self = object()
+    self.x = False
+    """
+    not documentation
+    """
+    '''
+    mod =  fromText(src, systemcls=systemcls)
+    assert not capsys.readouterr().out
+    assert list(mod.contents['C'].contents) == []
+    assert not mod.contents['self'].docstring
+
+@systemcls_param
+def test_inline_docstring_at_wrong_place(systemcls: Type[model.System], capsys: CapSys) -> None:
+    src = '''
+    a = objetc()
+    a.b = True
+    """
+    not documentation
+    """
+    b = object()
+    b.x: bool = False
+    """
+    still not documentation
+    """
+    c = {}
+    c[1] = True
+    """
+    Again not documenatation
+    """
+    d = {}
+    d[1].__init__ = True
+    """
+    Again not documenatation
+    """
+    e = {}
+    e[1].__init__ += True
+    """
+    Again not documenatation
+    """
+    '''
+    mod =  fromText(src, systemcls=systemcls)
+    assert not capsys.readouterr().out
+    assert list(mod.contents) == ['a', 'b', 'c', 'd', 'e']
+    assert not mod.contents['a'].docstring
+    assert not mod.contents['b'].docstring
+    assert not mod.contents['c'].docstring
+    assert not mod.contents['d'].docstring
+    assert not mod.contents['e'].docstring
+
+@systemcls_param
+def test_Final_constant_under_control_flow_block_is_still_constant(systemcls: Type[model.System], capsys: CapSys) -> None:
+    """
+    Test for issue https://github.com/twisted/pydoctor/issues/818
+    """
+    src = '''
+    import sys, random, typing as t
+    if sys.version_info > (3,10):
+        v:t.Final = 1
+    else:
+        v:t.Final = 2
+    
+    if random.choice([True, False]):
+        w:t.Final = 1
+    else:
+        w:t.Final = 2
+    
+    x: t.Final
+    x = 34
+    '''
+
+    mod =  fromText(src, systemcls=systemcls)
+    assert not capsys.readouterr().out
+
+    assert mod.contents['v'].kind == model.DocumentableKind.CONSTANT
+    assert mod.contents['w'].kind == model.DocumentableKind.CONSTANT
+    assert mod.contents['x'].kind == model.DocumentableKind.CONSTANT
+    
